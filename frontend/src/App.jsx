@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import { supabase } from "./supabaseClient";
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
 
@@ -34,7 +35,7 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [isMockFallback, setIsMockFallback] = useState(false);
 
-  // History states
+  // History / Inventory states
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
@@ -96,6 +97,77 @@ export default function App() {
     });
   }, []);
 
+  // Fetch recent inventory from Supabase (direct client with backend fallback)
+  const fetchHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      // Direct Supabase client query
+      const { data, error } = await supabase
+        .table("scans")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (!error && data) {
+        setHistory(data);
+      } else {
+        // Fallback to backend endpoint
+        const res = await fetch(`${BACKEND_URL}/api/history?limit=50`);
+        if (res.ok) {
+          const resData = await res.json();
+          setHistory(resData.scans || []);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load inventory from Supabase:", err);
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/history?limit=50`);
+        if (res.ok) {
+          const resData = await res.json();
+          setHistory(resData.scans || []);
+        }
+      } catch (e) {
+        console.error("Backend history fallback error:", e);
+      }
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  // Handle direct +/- stock quantity adjustments
+  const handleUpdateQuantity = async (itemId, currentQty, delta) => {
+    if (!itemId) return;
+    const currentInt = currentQty !== undefined && currentQty !== null ? parseInt(currentQty, 10) : 1;
+    const nextQty = Math.max(0, currentInt + delta);
+
+    // Optimistic UI update
+    setHistory((prev) =>
+      prev.map((item) => (item.id === itemId ? { ...item, quantity: nextQty } : item))
+    );
+
+    try {
+      // Direct Supabase update
+      const { error } = await supabase
+        .table("scans")
+        .update({ quantity: nextQty })
+        .eq("id", itemId);
+
+      if (error) {
+        console.warn("Direct Supabase update error, falling back to backend:", error);
+        // Fallback to backend endpoint
+        await fetch(`${BACKEND_URL}/api/inventory/${itemId}/quantity`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ quantity: nextQty }),
+        });
+      }
+    } catch (err) {
+      console.error("Failed to update quantity:", err);
+      // Re-sync with Supabase
+      fetchHistory();
+    }
+  };
+
   // Trigger POST /api/analyze (pure image, no audio required)
   const handleScanAndTranslate = async (imageOverride = null) => {
     // Guard against concurrent/overlapping scans
@@ -152,6 +224,9 @@ export default function App() {
         }
         setResults({ ...data, isDuplicate: false });
       }
+
+      // Automatically refresh inventory tab records upon scan
+      fetchHistory();
     } catch (err) {
       console.error("Analysis request failed:", err);
       setErrorMessage(err.message || "Failed to communicate with Backend.");
@@ -160,6 +235,12 @@ export default function App() {
       setLoading(false);
     }
   };
+
+  // Initial load of inventory
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
+
 
   // The Free-Flowing Auto Scanner with 15s cooldown and in-flight request lock
   useEffect(() => {
@@ -248,22 +329,6 @@ export default function App() {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
       if (timerRef.current) clearInterval(timerRef.current);
-    }
-  };
-
-  // Fetch recent history from Supabase via backend
-  const fetchHistory = async () => {
-    setHistoryLoading(true);
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/history?limit=15`);
-      if (res.ok) {
-        const data = await res.json();
-        setHistory(data.scans || []);
-      }
-    } catch (err) {
-      console.error("Failed to load history:", err);
-    } finally {
-      setHistoryLoading(false);
     }
   };
 
@@ -712,63 +777,127 @@ export default function App() {
             </section>
           </div>
         ) : (
-          /* History View (Supabase Logged Audits) */
+          /* Inventory View (Supabase Logged Audits & Quantities) */
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 shadow-xl flex-1 flex flex-col">
-            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-800 mb-6 gap-4">
               <div>
                 <h2 className="font-semibold text-lg text-slate-200 flex items-center space-x-2">
                   <span>🗄️</span>
                   <span>Supabase Inventory Records</span>
                 </h2>
-                <p className="text-xs text-slate-400 mt-0.5">Scanned products, brands, and expiry dates persisted in Supabase.</p>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Track stock counts, brands, and expiry dates persisted live in Supabase.
+                </p>
               </div>
-              <button
-                onClick={fetchHistory}
-                disabled={historyLoading}
-                className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs font-semibold rounded-lg border border-slate-700 transition"
-              >
-                {historyLoading ? "Refreshing..." : "↻ Refresh"}
-              </button>
+              <div className="flex items-center space-x-3">
+                <span className="text-xs font-mono text-slate-400 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
+                  {history.length} {history.length === 1 ? "Product" : "Products"} Tracked
+                </span>
+                <button
+                  onClick={fetchHistory}
+                  disabled={historyLoading}
+                  className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs font-semibold rounded-lg border border-slate-700 transition flex items-center space-x-1.5 active:scale-95"
+                >
+                  <span>↻</span>
+                  <span>{historyLoading ? "Refreshing..." : "Refresh"}</span>
+                </button>
+              </div>
             </div>
 
-            {historyLoading ? (
-              <div className="flex-1 flex items-center justify-center p-12 text-slate-400 text-sm">
-                Loading inventory from Supabase...
+            {historyLoading && history.length === 0 ? (
+              <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400 text-sm space-y-3">
+                <div className="w-8 h-8 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin"></div>
+                <p>Loading inventory from Supabase...</p>
               </div>
             ) : history.length === 0 ? (
               <div className="flex-1 flex flex-col items-center justify-center text-center p-12 text-slate-500">
                 <div className="text-3xl mb-3">📁</div>
                 <p className="text-sm font-medium text-slate-400">No product records in Supabase yet</p>
                 <p className="text-xs text-slate-500 mt-1 max-w-sm">
-                  Run the SQL in `backend/supabase_schema.sql` on Supabase to start persisting scanned items.
+                  Scan items using the camera to automatically log them into your Supabase database.
                 </p>
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 overflow-y-auto">
                 {history.map((scan) => {
                   const badge = getExpiryBadge(scan.expiry_date);
+                  const qty = scan.quantity !== undefined && scan.quantity !== null ? Number(scan.quantity) : 1;
+                  const isOutOfStock = qty <= 0;
+
                   return (
                     <div
-                      key={scan.id || Math.random()}
-                      className="p-4 rounded-xl bg-slate-950 border border-slate-800 flex flex-col justify-between space-y-3"
+                      key={scan.id || `${scan.brand}-${scan.item_name}-${Math.random()}`}
+                      className={`p-4 rounded-xl bg-slate-950 border transition-all flex flex-col justify-between space-y-3 shadow-md ${
+                        isOutOfStock
+                          ? "border-rose-900/50 opacity-75"
+                          : "border-slate-800 hover:border-slate-700"
+                      }`}
                     >
                       <div className="flex items-center justify-between text-xs">
-                        <span className="font-semibold text-indigo-400">{scan.brand || "Brand"}</span>
-                        <span className={`px-2 py-0.5 rounded-full border text-[10px] ${badge.color}`}>
+                        <span className="font-semibold text-indigo-400 truncate max-w-[140px]">
+                          {scan.brand || "Unspecified Brand"}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded-full border text-[10px] font-medium ${badge.color}`}>
                           {badge.text}
                         </span>
                       </div>
 
                       <div>
-                        <h3 className="font-bold text-white text-base leading-snug">{scan.item_name || "Product Item"}</h3>
+                        <h3 className="font-bold text-white text-base leading-snug">
+                          {scan.item_name || "Product Item"}
+                        </h3>
                         <p className="text-xs text-slate-400 mt-1 font-mono">
                           Expires: <span className="text-slate-200">{scan.expiry_date || "N/A"}</span>
                         </p>
                       </div>
 
+                      {/* Stock Quantity Control Widget */}
+                      <div className="bg-slate-900/90 rounded-lg p-2.5 border border-slate-800/80 flex items-center justify-between">
+                        <div className="flex flex-col">
+                          <span className="text-[10px] uppercase font-mono tracking-wider text-slate-400 font-semibold">
+                            STOCK QTY
+                          </span>
+                          {isOutOfStock ? (
+                            <span className="text-xs font-bold text-rose-400 font-mono">Out of Stock</span>
+                          ) : (
+                            <span className="text-xs font-bold text-emerald-400 font-mono">
+                              {qty} {qty === 1 ? "unit" : "units"}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center space-x-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800">
+                          <button
+                            onClick={() => handleUpdateQuantity(scan.id, qty, -1)}
+                            disabled={isOutOfStock}
+                            title="Decrease quantity by 1"
+                            className={`w-7 h-7 rounded-md font-bold text-sm flex items-center justify-center transition ${
+                              isOutOfStock
+                                ? "bg-slate-900 text-slate-600 cursor-not-allowed"
+                                : "bg-slate-800 hover:bg-rose-600 hover:text-white text-slate-300 active:scale-95"
+                            }`}
+                          >
+                            −
+                          </button>
+                          <span className="w-8 text-center font-mono font-bold text-sm text-white">
+                            {qty}
+                          </span>
+                          <button
+                            onClick={() => handleUpdateQuantity(scan.id, qty, 1)}
+                            title="Increase quantity by 1"
+                            className="w-7 h-7 rounded-md bg-slate-800 hover:bg-emerald-600 hover:text-white text-slate-300 font-bold text-sm flex items-center justify-center transition active:scale-95"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+
                       <div className="pt-2 border-t border-slate-900 flex items-center justify-between text-[11px] text-slate-500 font-mono">
                         <span>{scan.created_at ? new Date(scan.created_at).toLocaleDateString() : "Recent"}</span>
-                        <span className="text-emerald-400">✓ Supabase</span>
+                        <span className="text-emerald-400/90 flex items-center space-x-1">
+                          <span>●</span>
+                          <span>Supabase Live</span>
+                        </span>
                       </div>
                     </div>
                   );

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 # Import database helpers
-from supabase_client import log_scan_result, get_recent_scans
+from supabase_client import log_scan_result, get_recent_scans, update_scan_quantity
 
 # Load environment variables
 load_dotenv()
@@ -56,9 +56,26 @@ def health_check():
 @app.route("/api/history", methods=["GET"])
 def history():
     """Returns recent scans saved in Supabase."""
-    limit = request.args.get("limit", default=15, type=int)
+    limit = request.args.get("limit", default=50, type=int)
     scans = get_recent_scans(limit=limit)
     return jsonify({"scans": scans, "count": len(scans)}), 200
+
+
+@app.route("/api/inventory/<item_id>/quantity", methods=["PATCH", "POST"])
+def update_item_quantity_endpoint(item_id: str):
+    """Adjusts item quantity in Supabase via increment/decrement delta or exact quantity."""
+    try:
+        body = request.get_json(silent=True) or {}
+        delta = body.get("delta")
+        new_quantity = body.get("quantity")
+
+        updated = update_scan_quantity(item_id, delta=int(delta) if delta is not None else 0, new_quantity=new_quantity)
+        if updated:
+            return jsonify({"status": "success", "item": updated}), 200
+        return jsonify({"status": "error", "message": "Failed to update item quantity."}), 400
+    except Exception as err:
+        logger.error(f"Error in update_item_quantity_endpoint: {err}")
+        return jsonify({"status": "error", "message": str(err)}), 500
 
 
 @app.route("/api/analyze", methods=["POST"])
@@ -99,7 +116,7 @@ def analyze():
         if GEMINI_API_KEY:
             try:
                 model = genai.GenerativeModel(
-                    model_name="gemini-3.6-flash",
+                    model_name="gemini-flash-lite-latest",
                     system_instruction=SYSTEM_PROMPT,
                     generation_config={"response_mime_type": "application/json"}
                 )
